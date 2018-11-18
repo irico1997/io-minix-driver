@@ -1,14 +1,20 @@
 #include <minix/drivers.h>
 #include <minix/driver.h>
+#include <sys/ioctl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <minix/ds.h>
 #include <errno.h>
+#include <unistd.h>
 #include "secrets.h"
 
 #define UNOWNED -1
 #define TRUE 1
 #define FALSE 0
+#define O_WRONLY 2
+#define O_RDONLY 4
+#define O_RDWR 6
+
 /*
  * Function prototypes for the secrets driver.
  */
@@ -20,7 +26,7 @@ FORWARD _PROTOTYPE( int secrets_transfer,  (int procnr, int opcode,
                                           u64_t position, iovec_t *iov,
                                           unsigned nr_req) );
 FORWARD _PROTOTYPE( void secrets_geometry, (struct partition *entry) );
-
+FORWARD _PROTOTYPE( int secrets_ioctl,     (struct driver *d, message *m) );
 /* SEF functions and variables. */
 FORWARD _PROTOTYPE( void sef_local_startup, (void) );
 FORWARD _PROTOTYPE( int sef_cb_init, (int type, sef_init_info_t *info) );
@@ -52,8 +58,8 @@ PRIVATE struct device secrets_device;
 PRIVATE int open_counter;
 PRIVATE int fd_counter;
 PRIVATE char secret[SECRET_SIZE];
-PRIVATE struct ucred owner;
-PRIVATE int read;
+PRIVATE uid_t owner_uid;
+PRIVATE int was_read;
 PRIVATE int bytes_written;
 PRIVATE int bytes_read;
 
@@ -67,13 +73,14 @@ PRIVATE int secrets_ioctl(d, m)
    {
       return ENOTTY;
    }
-   res = sys_safecopyfrom(m->IOENDPT, (vir_bytes)m->IO_GRANT, 0,
+   res = sys_safecopyfrom(m->IO_ENDPT, (vir_bytes)m->IO_GRANT, 0,
          (vir_bytes)&grantee, sizeof(grantee), D);
    if(res == -1)
    {
+      printf("Unable to transfer control\n");
       return errno;
    }
-   owner -> uid = grantee;
+   owner_uid = grantee;
    return OK; 
 }
 
@@ -87,46 +94,64 @@ PRIVATE int secrets_open(d, m)
     struct driver *d;
     message *m;
 {
-    int access = m -> DEV_OPEN -> COUNT;
+    struct ucred current_process;
+    int access = m -> COUNT;
     int res;
-    uid_t grantee;
-    if(access == RDWR)
+    if(access == O_RDWR)
     {
+      printf("Cannot open for R/W access\n");
       return EACCES;
+    }
+    res = getnucred(m->IO_ENDPT, &current_process);
+    if(res == -1)
+    {
+       printf("Unable to get process credentials\n");
+       return errno;
     }
     if(access == O_WRONLY)
     {
-      if(owner -> uid == UNOWNED)
+      if(owner_uid == UNOWNED)
       {
-          res = getnucred(m->SELF, &owner);
-          if(res == -1)
-          {
-             return errno;
-          }
+          owner_uid = current_process.uid;
           fd_counter ++;
           open_counter ++;
+          printf("Writing to unowned secret, setting owner process to %d\n"
+                "Current number of open FDs: %d\n", current_process.uid, fd_counter);
+      }
+      else if(owner_uid == current_process.uid)
+      {
+         printf("Cannot have multiple open write FDs\n");
+         return ENOSPC;
       }
       else
       {
-         return ENOSPC;
+         printf("Current process does not own the secret\n");
+         return EACCES;
       }
     }
     else if(access == O_RDONLY)
     {
-      if(owner -> uid == UNOWNED)
+      if(owner_uid == UNOWNED || owner_uid == current_process.uid)
       {
-          res = getnucred(m->SELF, &owner);
-          if(res == -1)
-          {
-             return errno;
-          }
-          read = TRUE;
+          owner_uid = current_process.uid;
+          was_read = TRUE;
           fd_counter ++;
           open_counter ++;
+          printf("Reading from secret, setting owner process to %d\n"
+                "Current number of open FDs: %d\n", current_process.uid, fd_counter);
+      }
+      else
+      {
+         printf("Current process does not own the secret\n");
+         return EACCES;
       }
     }
+    else
+    {
+       printf("wadda hell... access: %d\n", access);
+    }
     printf("secrets_open(). Called %d time(s).\n", open_counter);
-    return OK;
+    return res;
 }
 
 PRIVATE int secrets_close(d, m)
@@ -134,10 +159,12 @@ PRIVATE int secrets_close(d, m)
     message *m;
 {
     fd_counter --;
-    if(read && fd_counter == 0)
+    printf("Closing secret, %d open file descriptors left\n", fd_counter);
+    if(was_read && fd_counter == 0)
     {
-       owner -> uid = UNOWNED;
-       read = FALSE;
+       printf("Resetting secret\n");
+       owner_uid = UNOWNED;
+       was_read = FALSE;
        bytes_written = 0;
        bytes_read = 0;
        /* reset ownership */
@@ -163,33 +190,78 @@ PRIVATE int secrets_transfer(proc_nr, opcode, position, iov, nr_req)
     iovec_t *iov;
     unsigned nr_req;
 {
-    int bytes, ret;
-
+    int bytes, res;
+    struct ucred current;
     printf("secrets_transfer()\n");
-
+    res = getnucred(proc_nr, &current);
+    /*
     bytes = strlen(SECRET_MESSAGE) - position.lo < iov->iov_size ?
             strlen(SECRET_MESSAGE) - position.lo : iov->iov_size;
+    */
+    if(current.uid != owner_uid)
+    {
+       printf("Process does not own the secret, cannot read or write\n"\
+              "Owner: %d Current: %d\n", owner_uid, current.uid);
+       return EACCES;
+    }
 
-    if (bytes <= 0)
+    if (iov-> iov_size <= 0)
     {
         return OK;
     }
+
     switch (opcode)
     {
         case DEV_GATHER_S:
+           printf("Reading...\n");
+           if(iov -> iov_size > bytes_written - bytes_read)
+           {
+              bytes = bytes_written - bytes_read;
+           }
+           res = sys_safecopyto(proc_nr, iov->iov_addr, 0,
+                               (vir_bytes) (secret[bytes_read]),
+                                bytes, D);
+           iov->iov_size -= bytes;
+           bytes_read += bytes;
+           printf("Read %d bytes out of %d.\n", bytes, iov -> iov_size);
+           break;
+
+        /*case DEV_GATHER_S:
             ret = sys_safecopyto(proc_nr, iov->iov_addr, 0,
                                 (vir_bytes) (SECRET_MESSAGE + position.lo),
                                  bytes, D);
             iov->iov_size -= bytes;
-            break;
-
+            break;*/
+        
         case DEV_SCATTER_S:
-            break;
+           printf("Writing...\n");
+           if(iov -> iov_size + bytes_written > SECRET_SIZE)
+           {
+              printf("Cannot write outside the buffer size, %d\n"\
+                    "Attempting to write %d bytes, already written %d\n",
+                    SECRET_SIZE, iov -> iov_size, bytes_written);
+              return ENOSPC;
+           }
+           res = sys_safecopyfrom(proc_nr, iov->iov_addr, 0,
+                               (vir_bytes) (secret[bytes_written]),
+                                bytes, D);
+           bytes_written += iov -> iov_size;
+           iov->iov_size -= iov -> iov_size;
+           printf("Wrote %d bytes.\n", iov->iov_size);
+
+           break;
+
+        /*case DEV_SCATTER_S:
+            ret = sys_safecopyfrom(proc_nr, iov->iov_addr, 0,
+                                (vir_bytes) (SECRET_MESSAGE + position.lo),
+                                 bytes, D);
+            break;*/
 
         default:
+            printf("Invalid request\n");
             return EINVAL;
     }
-    return ret;
+    return res;
 }
 
 PRIVATE void secrets_geometry(entry)
@@ -201,13 +273,14 @@ PRIVATE void secrets_geometry(entry)
     entry->sectors   = 0;
 }
 
-PRIVATE int sef_cb_lu_state_save(int state) {
+PRIVATE int sef_cb_lu_state_save(int state)
+{
 /* Save the state. */
     ds_publish_mem("open_counter", &open_counter, sizeof(open_counter), DSF_OVERWRITE);
     ds_publish_mem("secret", secret, sizeof(secret) * SECRET_SIZE, DSF_OVERWRITE);
-    ds_publish_mem("owner", &owner, sizeof(struct ucred), DSF_OVERWRITE);
+    ds_publish_mem("owner", &owner_uid, sizeof(owner_uid), DSF_OVERWRITE);
     ds_publish_mem("fd_counter", &fd_counter, sizeof(fd_counter), DSF_OVERWRITE);
-    ds_publish_mem("read", &read, sizeof(read), DSF_OVERWRITE);
+    ds_publish_mem("was_read", &was_read, sizeof(was_read), DSF_OVERWRITE);
     ds_publish_mem("bytes_written", &bytes_written, sizeof(bytes_written), DSF_OVERWRITE);
     ds_publish_mem("bytes_read", &bytes_read, sizeof(bytes_read), DSF_OVERWRITE);
     return OK;
@@ -215,35 +288,36 @@ PRIVATE int sef_cb_lu_state_save(int state) {
 
 PRIVATE int lu_state_restore() {
 /* Restore the state. */
+   /*
     int temp_ocounter;
     int temp_fdcounter;
-    struct ucred temp_owner; /* check if this is right way */
+    uid_t temp_owner;
     char temp_secret[SECRET_SIZE]; 
     int temp_read;
     int temp_bytes_written;
     int temp_bytes_read;
-    ds_retrieve_mem("open_counter", &temp_ocounter, sizeof(temp_ocounter));
-    ds_retrieve_mem("fd_counter", &temp_fd_counter, sizeof(temp_fd_counter));
-    ds_retrieve_mem("owner", &temp_owner, sizeof(struct ucred)); /* hmmm */
-    ds_retrieve_mem("secret", &temp_ocounter, sizeof(temp_ocounter));
-    ds_retrieve_mem("read", &temp_ocounter, sizeof(temp_ocounter));
-    ds_retrieve_mem("bytes_written", &temp_ocounter, sizeof(temp_ocounter));
-    ds_retrieve_mem("bytes_read", &temp_ocounter, sizeof(temp_ocounter));
+    ds_retrieve_mem("open_counter", (char *)(&temp_ocounter), sizeof(int));
+    ds_retrieve_mem("fd_counter", (char *)(&temp_fdcounter), sizeof(int));
+    ds_retrieve_mem("owner", (char *)(&temp_owner), sizeof(uid_t)); 
+    ds_retrieve_mem("secret", (char *)(&temp_secret), sizeof(char) * SECRET_SIZE);
+    ds_retrieve_mem("was_read", (char *)(&temp_read), sizeof(int));
+    ds_retrieve_mem("bytes_written", (char *)(&temp_bytes_written), sizeof(int));
+    ds_retrieve_mem("bytes_read", (char *)(&temp_bytes_read), sizeof(int));
     ds_delete_mem("open_counter");
     ds_delete_mem("fd_counter");
     ds_delete_mem("owner");
     ds_delete_mem("secret");
-    ds_delete_mem("read");
+    ds_delete_mem("was_read");
     ds_delete_mem("bytes_written");
     ds_delete_mem("bytes_read");
     open_counter = temp_ocounter;
     fd_counter = temp_fdcounter;
-    owner = temp_owner; /* do i have to copy some dumbe way */
+    owner_uid = temp_owner; 
     secret = temp_secret;
-    read = temp_read;
+    was_read = temp_read;
     bytes_written = temp_bytes_written;
     bytes_read = temp_bytes_read;
-    /* init the rest */
+    */
     return OK;
 }
 
@@ -279,8 +353,8 @@ PRIVATE int sef_cb_init(int type, sef_init_info_t *info)
     fd_counter = 0;
     bytes_read = 0;
     bytes_written = 0;
-    read = FALSE;
-    owner -> uid = UNOWNED;
+    was_read = FALSE;
+    owner_uid = UNOWNED;
     switch(type) {
         case SEF_INIT_FRESH:
             printf("%s", SECRET_MESSAGE);
